@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     # Razorpay Dashboard > Settings > Webhooks > (create one) > Secret.
     # Used to verify /api/webhooks/razorpay requests are genuinely from Razorpay.
     RAZORPAY_WEBHOOK_SECRET: str = ""
+    WHATSAPP_BUSINESS_NUMBER: str = ""
 
     @property
     def database_url(self) -> str:

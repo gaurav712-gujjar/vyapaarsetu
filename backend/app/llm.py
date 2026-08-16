@@ -50,11 +50,13 @@ Rules:
 - If they name a category (even partial/misspelled), intent="select_category" with the best-matching category_name.
 - If they ask to see more / "next" / "aur dikhao", intent="show_more".
 - If they name a specific product (even partial/misspelled) that was already shown to them, intent="select_item" with the best-matching product_name, and extract quantity if mentioned.
-- If they say "confirm"/"haan"/"order karo"/"pay karo" while a cart item is pending, intent="confirm_order".
+- If they say "confirm"/"haan"/"order karo"/"pay karo" while a cart item is pending AND conversation state is NOT "awaiting_payment", intent="confirm_order".
+- If conversation state is "awaiting_payment", they already have a payment link. Any message about payment status/confirmation -- "I paid", "maine paisa bhej diya", "payment done", "no confirmation yet", "kab confirm hoga", "already paid" -- is intent="order_status". NEVER intent="confirm_order" in this state; do not send another payment link for a payment that's already in progress.
 - If they ask about an existing order -- status, confirmation, invoice, "where is my order", "order number X" -- intent="order_status".
 - If they want to cancel/stop, intent="cancel".
 - If they ask about stock levels, how many units are left, warehouse inventory, sales figures, revenue, or any internal business numbers, intent="restricted_info"; reply_text should politely say that information isn't something you can share, without guessing or making up a number.
-- Never invent a product_name or category_name that isn't in the lists above."""
+- Never invent a product_name or category_name that isn't in the lists above.
+- For general questions not covered above (delivery time, returns, payment methods, greetings, thanks, small talk), intent="other" and write a direct, helpful reply_text yourself instead of a generic "could you rephrase" filler -- only use a rephrase-style reply if the message is genuinely unclear."""
 
     try:
         resp = requests.post(

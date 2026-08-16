@@ -32,6 +32,8 @@ from .config import settings
 from .database import SessionLocal
 from .llm import parse_customer_message
 from .messaging import send_text, send_image
+from .queue_utils import enqueue_order_pipeline
+
 from .models import (
     Category, ChannelEnum, ConversationState, ConvStateEnum, Order, OrderItem,
     OrderStatusEnum, PaymentStatusEnum, Product,
@@ -80,11 +82,25 @@ def _catalog_text(db: Session) -> str:
     # Deliberately: name, price, category only -- never stock count or cost/revenue data.
     return "\n".join(f"- {p.name} (Rs.{int(p.price)}) [{p.category.name}]" for p in products)
 
+def _category_catalog_text(db: Session, category_id: int) -> str:
+    products = (
+        db.query(Product)
+        .filter(Product.category_id == category_id, Product.is_active == True, Product.stock > 0)  # noqa: E712
+        .order_by(Product.id.desc())
+        .all()
+    )
+    return "\n".join(f"- {p.name} (Rs.{int(p.price)}) [{p.category.name}]" for p in products)
+
 
 def _find_product(db: Session, name_hint: str | None) -> Product | None:
     if not name_hint:
         return None
-    products = db.query(Product).filter(Product.is_active == True).all()  # noqa: E712
+    # Only match against in-stock products -- same filter used everywhere else
+    # a customer-facing product list is built (_catalog_text, _send_category_page).
+    # Otherwise a similarly-named but out-of-stock product can win the fuzzy
+    # match (cutoff=0.4 is loose) and the customer wrongly gets an "out of
+    # stock" reply for an item that's actually available.
+    products = db.query(Product).filter(Product.is_active == True, Product.stock > 0).all()  # noqa: E712
     names = {p.name: p for p in products}
     match = difflib.get_close_matches(name_hint, names.keys(), n=1, cutoff=0.4)
     return names[match[0]] if match else None
@@ -183,19 +199,28 @@ def _create_order_and_payment_link(db: Session, state: ConversationState) -> Non
     db.flush()
     db.add(OrderItem(order_id=order.id, product_id=product.id, quantity=qty, unit_price=product.price))
 
+    payment_link_payload = {
+        "amount": int(round(total * 100)),
+        "currency": "INR",
+        "accept_partial": False,
+        "description": f"{qty} x {product.name}",
+        "customer": {
+            "name": state.customer_name or "Customer",
+            "contact": state.external_id if channel_val == "whatsapp" else "",
+        },
+        "notify": {"sms": False, "email": False},
+        "reference_id": f"order_{order.id}",
+    }
+    if channel_val == "whatsapp" and settings.WHATSAPP_BUSINESS_NUMBER:
+        # Send the customer straight back into this WhatsApp chat once they're
+        # done on Razorpay's page, instead of leaving them stranded there.
+        # This redirect is UX only -- actual confirmation still comes from
+        # the payment_link.paid webhook, never from this callback alone.
+        payment_link_payload["callback_url"] = f"https://wa.me/{settings.WHATSAPP_BUSINESS_NUMBER}"
+        payment_link_payload["callback_method"] = "get"
+
     try:
-        link = razorpay_client.payment_link.create({
-            "amount": int(round(total * 100)),
-            "currency": "INR",
-            "accept_partial": False,
-            "description": f"{qty} x {product.name}",
-            "customer": {
-                "name": state.customer_name or "Customer",
-                "contact": state.external_id if channel_val == "whatsapp" else "",
-            },
-            "notify": {"sms": False, "email": False},
-            "reference_id": f"order_{order.id}",
-        })
+        link = razorpay_client.payment_link.create(payment_link_payload)
     except Exception:
         logger.exception("Razorpay payment link creation failed for order #%s", order.id)
         db.rollback()
@@ -226,14 +251,24 @@ def _describe_order(db: Session, state: ConversationState) -> str:
     if state.pending_order_id:
         order = db.query(Order).filter(Order.id == state.pending_order_id).first()
     if not order:
-        order = (
-            db.query(Order)
-            .filter(Order.channel == state.channel, Order.customer_phone == state.external_id)
-            .order_by(Order.id.desc())
-            .first()
-        )
-    if not order:
         return "I don't see any orders on your account yet -- reply with a category name to start one!"
+
+    # Self-heal a stale "created" status: if the payment_link.paid webhook
+    # is delayed or was missed, check directly with Razorpay before telling
+    # the customer nothing has happened -- this is exactly what "I paid but
+    # got no confirmation" messages need.
+    if order.payment_status == PaymentStatusEnum.created and order.razorpay_order_id:
+        try:
+            link = razorpay_client.payment_link.fetch(order.razorpay_order_id)
+            if link.get("status") == "paid":
+                order.payment_status = PaymentStatusEnum.paid
+                payments = link.get("payments") or []
+                if payments:
+                    order.razorpay_payment_id = payments[-1].get("payment_id")
+                db.commit()
+                enqueue_order_pipeline(db, order)
+        except Exception:
+            logger.exception("Live Razorpay status check failed for order #%s", order.id)
 
     items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
     item_lines = []
@@ -248,6 +283,21 @@ def _describe_order(db: Session, state: ConversationState) -> str:
         OrderStatusEnum.failed: "Payment not completed",
     }.get(order.status, "In progress")
 
+    payment_word = {
+        PaymentStatusEnum.not_initiated: "Not started",
+        PaymentStatusEnum.created: "Link sent -- waiting for you to complete payment",
+        PaymentStatusEnum.paid: "Paid",
+        PaymentStatusEnum.failed: "Failed",
+    }.get(order.payment_status, order.payment_status.value)
+
+    return (
+        f"Order #{order.id}\n"
+        f"Items: {', '.join(item_lines) if item_lines else '—'}\n"
+        f"Total: Rs.{float(order.total_amount):.0f}\n"
+        f"Payment: {payment_word}\n"
+        f"Status: {status_word}"
+    )
+
     return (
         f"Order #{order.id}\n"
         f"Items: {', '.join(item_lines) if item_lines else '—'}\n"
@@ -261,8 +311,12 @@ def handle_inbound_message(channel: str, external_id: str, sender_name: str | No
     db = SessionLocal()
     try:
         state = _get_or_create_state(db, channel, external_id, sender_name)
+        current_category_id = (state.context or {}).get("category_id")
+        catalog_for_llm = (
+            _category_catalog_text(db, current_category_id) if current_category_id else _catalog_text(db)
+        )
         parsed = parse_customer_message(
-            _categories_text(db), _catalog_text(db), state.state.value, str(state.cart or {}), text or "",
+            _categories_text(db), catalog_for_llm, state.state.value, str(state.cart or {}), text or "",
         )
         intent = parsed.get("intent", "other")
 
@@ -317,6 +371,12 @@ def handle_inbound_message(channel: str, external_id: str, sender_name: str | No
             return
 
         if intent == "confirm_order":
+            if state.state == ConvStateEnum.awaiting_payment and state.pending_order_id:
+                # An order is already awaiting payment for this customer --
+                # never spin up a second Order/payment link for the same
+                # cart. Show the real, live-checked status instead.
+                send_text(channel, external_id, _describe_order(db, state))
+                return
             if not state.cart or not state.cart.get("product_id"):
                 send_text(channel, external_id, "You haven't picked an item yet -- here are our categories:")
                 _send_categories(db, channel, external_id)
@@ -377,8 +437,9 @@ def issue_refund_and_reassure(order_id: int) -> None:
             send_text(
                 channel_val, conv.external_id,
                 "We're sorry -- we ran into an issue processing your order. Your payment has "
-                "already gone through, so a full refund is on its way and you don't need to do "
-                "anything further. We'll follow up here shortly.",
+                "already gone through, so please don't worry: a full refund is being processed "
+                "and will reach you shortly, and our team will personally reach out to you here "
+                "soon. You don't need to do anything further.",
             )
     finally:
         db.close()
