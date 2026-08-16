@@ -88,22 +88,26 @@ async def razorpay_events(
         if not order or order.payment_status == PaymentStatusEnum.paid:
             return {"status": "ignored"}
 
-        order.payment_status = PaymentStatusEnum.failed
-        db.commit()
-
-        # Honest message -- payment did NOT happen, so we say so and invite a retry.
-        conv = (
-            db.query(ConversationState)
-            .filter(ConversationState.pending_order_id == order.id)
+        # Don't declare failure on Razorpay's word alone -- schedule one
+        # automatic backend re-check (same retry_payment_check step used by
+        # the website checkout flow). If it's genuinely never paid, this
+        # naturally lands in the DLQ after retries via the normal queue
+        # pipeline, and the customer gets an honest "didn't go through"
+        # message from there (see queue_worker.py).
+        from ..models import EventQueue, EventTypeEnum, QueueStatusEnum, OrderStatusEnum
+        existing = (
+            db.query(EventQueue)
+            .filter(
+                EventQueue.order_id == order.id,
+                EventQueue.event_type == EventTypeEnum.retry_payment_check,
+                EventQueue.status.in_([QueueStatusEnum.pending, QueueStatusEnum.processing]),
+            )
             .first()
         )
-        if conv:
-            channel_val = conv.channel.value if hasattr(conv.channel, "value") else conv.channel
-            send_text(
-                channel_val, conv.external_id,
-                "That payment link expired before completing. No charge was made -- "
-                "just reply with the item name again whenever you're ready to order.",
-            )
+        if not existing:
+            db.add(EventQueue(order_id=order.id, event_type=EventTypeEnum.retry_payment_check, payload={}))
+            order.status = OrderStatusEnum.queued
+            db.commit()
         return {"status": "ok"}
 
     return {"status": "ignored"}

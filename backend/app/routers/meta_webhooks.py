@@ -117,15 +117,22 @@ async def instagram_events(
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     body = await request.json()
+    logger.info("Instagram webhook raw payload: %s", body)
     handled = []
 
     for entry in body.get("entry", []):
         for messaging in entry.get("messaging", []):
-            message = messaging.get("message", {})
+            if "message" not in messaging:
+                continue  # read receipt / delivery / reaction event, not an actual message
+            message = messaging["message"]
             if message.get("is_echo"):
                 continue  # skip messages the business itself sent
             sender_id = messaging.get("sender", {}).get("id")
             text = message.get("text", "")
+
+            if not sender_id:
+                logger.warning("Instagram message event with no sender id, skipping: %s", messaging)
+                continue
 
             handle_inbound_message("instagram", sender_id, None, text)
             handled.append(sender_id)

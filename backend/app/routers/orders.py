@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..config import settings
-from ..models import Order, OrderItem, Product, ChannelEnum, OrderStatusEnum, PaymentStatusEnum
+from ..models import Order, OrderItem, Product, ChannelEnum, OrderStatusEnum, PaymentStatusEnum, EventQueue, EventTypeEnum, QueueStatusEnum
 from ..schemas import CheckoutRequest, CheckoutResponse, PaymentVerifyRequest, OrderOut
 from ..queue_utils import enqueue_order_pipeline
 
@@ -102,6 +102,41 @@ def verify_payment(payload: PaymentVerifyRequest, db: Session = Depends(get_db))
     enqueue_order_pipeline(db, order)
     db.refresh(order)
     return order
+
+
+@router.post("/{order_id}/payment-retry")
+def payment_retry(order_id: int, db: Session = Depends(get_db)):
+    """
+    Called by the frontend when Razorpay's checkout reports a failed payment
+    or the customer closes the payment modal. Instead of just giving up, this
+    schedules a background check against Razorpay itself (with automatic
+    retries) so a payment that actually succeeded a moment later isn't lost,
+    and only a genuinely failed payment ends up in the DLQ for the shop owner
+    to see -- the customer never has to manually confirm anything.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.payment_status == PaymentStatusEnum.paid:
+        return {"status": "already paid"}
+
+    # Avoid stacking duplicate retry-check events if the customer clicks
+    # retry multiple times in a row.
+    existing = (
+        db.query(EventQueue)
+        .filter(
+            EventQueue.order_id == order.id,
+            EventQueue.event_type == EventTypeEnum.retry_payment_check,
+            EventQueue.status.in_([QueueStatusEnum.pending, QueueStatusEnum.processing]),
+        )
+        .first()
+    )
+    if not existing:
+        db.add(EventQueue(order_id=order.id, event_type=EventTypeEnum.retry_payment_check, payload={}))
+        order.status = OrderStatusEnum.queued
+        db.commit()
+
+    return {"status": "checking", "order_id": order.id}
 
 
 @router.get("/{order_id}", response_model=OrderOut)

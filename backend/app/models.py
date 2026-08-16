@@ -43,6 +43,7 @@ class EventTypeEnum(str, enum.Enum):
     verify_payment = "verify_payment"
     update_inventory = "update_inventory"
     send_confirmation = "send_confirmation"
+    retry_payment_check = "retry_payment_check"
 
 
 class QueueStatusEnum(str, enum.Enum):
@@ -170,6 +171,7 @@ class ConversationState(Base):
     customer_name = Column(String(150))
     state = Column(Enum(ConvStateEnum), nullable=False, default=ConvStateEnum.new)
     cart = Column(JSON)  # {"product_id":.., "name":.., "price":.., "quantity":..}
+    context = Column(JSON)  # {"category_id":.., "offset":..} -- category browsing/pagination, separate from cart
     pending_order_id = Column(BigInteger, ForeignKey("orders.id"), nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())

@@ -68,10 +68,31 @@ export default function Checkout({ cart, updateQty, removeItem, clearCart }) {
           }
         },
         modal: {
-          ondismiss: () => setStatus("idle"),
+          ondismiss: async () => {
+            // Customer closed the modal, possibly after a failed attempt --
+            // ask the backend to double-check with Razorpay in the
+            // background (it retries automatically) rather than assuming
+            // the worst immediately.
+            try {
+              await api.paymentRetry(checkoutRes.order_id);
+            } catch (_) { /* best-effort */ }
+            setStatus("idle");
+          },
         },
         theme: { color: "#22314F" },
       });
+
+      rzp.on("payment.failed", async () => {
+        try {
+          await api.paymentRetry(checkoutRes.order_id);
+        } catch (_) { /* best-effort */ }
+        setStatus("error");
+        setError(
+          "That attempt didn't go through. We're double-checking with the payment provider in the " +
+          "background — if any amount was deducted, it will be automatically refunded. Feel free to try again."
+        );
+      });
+
       rzp.open();
     } catch (err) {
       setError(err.message);

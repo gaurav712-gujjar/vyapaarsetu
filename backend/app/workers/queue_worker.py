@@ -17,6 +17,7 @@ import asyncio
 import logging
 import random
 import uuid
+import razorpay
 from datetime import datetime, timedelta
 
 from sqlalchemy import text
@@ -25,7 +26,8 @@ from sqlalchemy.orm import Session
 from ..database import SessionLocal
 from ..config import settings
 from ..messaging import send_text
-from ..conversation import issue_refund_and_reassure
+from ..conversation import issue_refund_and_reassure, send_payment_failed_message
+from ..queue_utils import enqueue_order_pipeline
 from ..models import (
     EventQueue, QueueStatusEnum, EventTypeEnum,
     Order, OrderStatusEnum, PaymentStatusEnum,
@@ -117,10 +119,51 @@ def _handle_send_confirmation(db: Session, order: Order) -> None:
     db.commit()
 
 
+def _handle_retry_payment_check(db: Session, order: Order) -> None:
+    """
+    Runs when a payment is reported failed/dismissed/expired -- from the
+    website (POST /api/orders/{id}/payment-retry) or from a chat-commerce
+    payment link (payment_link.expired/cancelled webhook). Rather than
+    trusting that signal alone, we ask Razorpay directly whether money
+    actually moved -- covers races like a bank confirming a split-second
+    after the browser/webhook reported failure.
+
+    If Razorpay confirms paid -> mark paid, hand off to the normal pipeline.
+    If not paid yet -> raise, which triggers the SAME automatic exponential-
+    backoff retry (_process_event below) as every other pipeline step, and
+    after MAX_RETRIES the order lands in the DLQ exactly like any other
+    permanently-failed step.
+    """
+    if order.payment_status == PaymentStatusEnum.paid:
+        return  # already resolved by a concurrent verify/webhook call
+
+    razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+    channel_val = order.channel.value if hasattr(order.channel, "value") else order.channel
+
+    if channel_val in ("whatsapp", "instagram"):
+        # order.razorpay_order_id holds a Payment LINK id for chat-commerce orders.
+        link = razorpay_client.payment_link.fetch(order.razorpay_order_id)
+        paid = link.get("status") == "paid"
+        status_label = link.get("status")
+    else:
+        rp_order = razorpay_client.order.fetch(order.razorpay_order_id)
+        paid = rp_order.get("status") == "paid"
+        status_label = rp_order.get("status")
+
+    if paid:
+        order.payment_status = PaymentStatusEnum.paid
+        db.commit()
+        enqueue_order_pipeline(db, order)
+        return
+
+    raise RuntimeError(f"Razorpay payment for order #{order.id} not yet paid (status={status_label})")
+
+
 HANDLERS = {
     EventTypeEnum.verify_payment: _handle_verify_payment,
     EventTypeEnum.update_inventory: _handle_update_inventory,
     EventTypeEnum.send_confirmation: _handle_send_confirmation,
+    EventTypeEnum.retry_payment_check: _handle_retry_payment_check,
 }
 
 
@@ -161,10 +204,15 @@ def _process_event(db: Session, event: EventQueue) -> None:
 
             channel_val = order.channel.value if hasattr(order.channel, "value") else order.channel
             if channel_val in ("whatsapp", "instagram"):
-                # Payment already succeeded (that's step 1 of the pipeline) but
-                # something downstream failed permanently -- refund it and tell
-                # the customer honestly, rather than leaving them guessing.
-                issue_refund_and_reassure(order.id)
+                if event.event_type == EventTypeEnum.retry_payment_check and order.payment_status != PaymentStatusEnum.paid:
+                    # Payment genuinely never went through -- say so honestly,
+                    # never claim money was taken.
+                    send_payment_failed_message(order.id)
+                else:
+                    # Payment already succeeded (verify_payment step passed) but
+                    # something downstream failed permanently -- refund it and
+                    # tell the customer honestly, rather than leaving them guessing.
+                    issue_refund_and_reassure(order.id)
         else:
             backoff_seconds = (2 ** event.retry_count) + random.uniform(0, 1)
             event.status = QueueStatusEnum.pending

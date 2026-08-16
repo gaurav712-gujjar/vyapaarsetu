@@ -33,6 +33,8 @@ export const api = {
     request("/api/orders/checkout", { method: "POST", body: JSON.stringify(payload) }),
   verifyPayment: (payload) =>
     request("/api/orders/verify-payment", { method: "POST", body: JSON.stringify(payload) }),
+  paymentRetry: (orderId) =>
+    request(`/api/orders/${orderId}/payment-retry`, { method: "POST" }),
   getOrder: (orderId) => request(`/api/orders/${orderId}`),
 
   // Admin auth

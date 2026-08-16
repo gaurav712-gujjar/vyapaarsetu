@@ -3,14 +3,23 @@ Chat-commerce orchestrator.
 
 Flow per inbound message:
   1. Load (or create) this customer's ConversationState.
-  2. Ask the LLM to classify the message (greeting / browse / select item /
-     confirm / cancel) against the current catalog + cart.
-  3. Act on it: send the catalog, update the cart, or -- on confirm -- create
-     an Order + Razorpay Payment Link and message the pay link back.
+  2. Ask the LLM to classify the message against categories/catalog/cart/state.
+  3. Act on it:
+     - greeting/browse_categories -> list categories
+     - select_category -> show first page of items in that category, WITH IMAGES
+     - show_more -> next page of the same category
+     - select_item -> add to cart
+     - confirm_order -> create an Order + Razorpay Payment Link, message it back
+     - order_status -> look up and describe the customer's most recent order
+     - restricted_info -> politely decline (stock counts / revenue are never
+       exposed here -- that data only exists behind the admin-only,
+       require_admin-gated dashboard endpoints; the chat layer never queries
+       it in the first place)
   4. Razorpay's webhook (routers/razorpay_webhooks.py) later marks the order
-     paid and triggers the normal DLQ/queue pipeline; on final pipeline
-     failure, issue_refund_and_reassure() below is called to refund the
-     customer and send a calm, reassuring message.
+     paid and triggers the normal DLQ/queue pipeline. If payment itself fails
+     to confirm, or a later pipeline step fails permanently, the customer is
+     messaged honestly -- see queue_worker.py's DLQ handling for the exact
+     wording logic (never claims a payment succeeded when it didn't).
 """
 import difflib
 import logging
@@ -22,17 +31,17 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .database import SessionLocal
 from .llm import parse_customer_message
-from .messaging import send_text
+from .messaging import send_text, send_image
 from .models import (
-    ChannelEnum, ConversationState, ConvStateEnum, Order, OrderItem,
+    Category, ChannelEnum, ConversationState, ConvStateEnum, Order, OrderItem,
     OrderStatusEnum, PaymentStatusEnum, Product,
 )
 
 logger = logging.getLogger("vyapaarsetu.conversation")
 razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
-CATALOG_LIMIT = 40
-CATALOG_SHOW_LIMIT = 15
+CATALOG_LIMIT = 60          # products considered when the LLM matches a name
+CATEGORY_PAGE_SIZE = 5      # items shown per page within a category (each is its own image message)
 
 
 def _get_or_create_state(db: Session, channel: str, external_id: str, name: str | None) -> ConversationState:
@@ -44,7 +53,7 @@ def _get_or_create_state(db: Session, channel: str, external_id: str, name: str 
     if not state:
         state = ConversationState(
             channel=channel, external_id=external_id, customer_name=name,
-            state=ConvStateEnum.new, cart={},
+            state=ConvStateEnum.new, cart={}, context={},
         )
         db.add(state)
         db.commit()
@@ -55,6 +64,11 @@ def _get_or_create_state(db: Session, channel: str, external_id: str, name: str 
     return state
 
 
+def _categories_text(db: Session) -> str:
+    cats = db.query(Category).order_by(Category.name).all()
+    return ", ".join(c.name for c in cats)
+
+
 def _catalog_text(db: Session) -> str:
     products = (
         db.query(Product)
@@ -63,6 +77,7 @@ def _catalog_text(db: Session) -> str:
         .limit(CATALOG_LIMIT)
         .all()
     )
+    # Deliberately: name, price, category only -- never stock count or cost/revenue data.
     return "\n".join(f"- {p.name} (Rs.{int(p.price)}) [{p.category.name}]" for p in products)
 
 
@@ -75,22 +90,67 @@ def _find_product(db: Session, name_hint: str | None) -> Product | None:
     return names[match[0]] if match else None
 
 
-def _send_catalog(db: Session, channel: str, external_id: str) -> None:
+def _find_category(db: Session, name_hint: str | None) -> Category | None:
+    if not name_hint:
+        return None
+    cats = db.query(Category).all()
+    names = {c.name: c for c in cats}
+    match = difflib.get_close_matches(name_hint, names.keys(), n=1, cutoff=0.4)
+    return names[match[0]] if match else None
+
+
+def _send_categories(db: Session, channel: str, external_id: str) -> None:
+    cats = db.query(Category).order_by(Category.name).all()
+    if not cats:
+        send_text(channel, external_id, "We don't have any categories set up yet -- please check back soon!")
+        return
+    lines = [f"{i + 1}. {c.name}" for i, c in enumerate(cats)]
+    send_text(
+        channel, external_id,
+        "Here's what we sell:\n" + "\n".join(lines) + "\n\nReply with a category name to see what's inside.",
+    )
+
+
+def _send_category_page(db: Session, state: ConversationState, category: Category, offset: int) -> None:
+    channel_val = state.channel.value if hasattr(state.channel, "value") else state.channel
     products = (
         db.query(Product)
-        .filter(Product.is_active == True, Product.stock > 0)  # noqa: E712
+        .filter(Product.category_id == category.id, Product.is_active == True, Product.stock > 0)  # noqa: E712
         .order_by(Product.id.desc())
-        .limit(CATALOG_SHOW_LIMIT)
+        .offset(offset)
+        .limit(CATEGORY_PAGE_SIZE)
         .all()
     )
     if not products:
-        send_text(channel, external_id, "We're currently out of stock -- please check back soon!")
+        if offset == 0:
+            send_text(channel_val, state.external_id, f"Nothing available in {category.name} right now -- check back soon!")
+        else:
+            send_text(channel_val, state.external_id, "That's everything in this category.")
         return
-    lines = [f"{i + 1}. {p.name} -- Rs.{int(p.price)}" for i, p in enumerate(products)]
-    send_text(
-        channel, external_id,
-        "Here's what we have:\n" + "\n".join(lines) + "\n\nJust reply with the item name to order it.",
+
+    for p in products:
+        caption = f"{p.name} -- Rs.{int(p.price)}"
+        if p.image_url:
+            send_image(channel_val, state.external_id, p.image_url, caption)
+        else:
+            send_text(channel_val, state.external_id, caption)
+
+    # Peek one past the page to know whether to offer "show more".
+    has_more = (
+        db.query(Product)
+        .filter(Product.category_id == category.id, Product.is_active == True, Product.stock > 0)  # noqa: E712
+        .order_by(Product.id.desc())
+        .offset(offset + CATEGORY_PAGE_SIZE)
+        .limit(1)
+        .first()
+        is not None
     )
+    footer = "Reply with an item name to order it."
+    if has_more:
+        footer += " Or reply 'more' to see more items in this category."
+    send_text(channel_val, state.external_id, footer)
+
+    state.context = {**(state.context or {}), "category_id": category.id, "offset": offset}
 
 
 def _create_order_and_payment_link(db: Session, state: ConversationState) -> None:
@@ -143,8 +203,8 @@ def _create_order_and_payment_link(db: Session, state: ConversationState) -> Non
         return
 
     # Reuse the razorpay_order_id column to store the payment LINK id (not an
-    # Orders-API order id) -- razorpay_webhooks.py looks it up by this same
-    # field when the payment_link.paid event arrives.
+    # Orders-API order id) -- razorpay_webhooks.py and queue_worker.py's
+    # retry_payment_check handler both look this up the same way.
     order.razorpay_order_id = link["id"]
     order.payment_status = PaymentStatusEnum.created
     state.pending_order_id = order.id
@@ -158,34 +218,97 @@ def _create_order_and_payment_link(db: Session, state: ConversationState) -> Non
     )
 
 
+def _describe_order(db: Session, state: ConversationState) -> str:
+    """Builds a customer-facing order status/confirmation summary. Only ever
+    pulls order-level fields (status, items, total, payment) -- never touches
+    stock or revenue data, which live behind separate admin-only endpoints."""
+    order = None
+    if state.pending_order_id:
+        order = db.query(Order).filter(Order.id == state.pending_order_id).first()
+    if not order:
+        order = (
+            db.query(Order)
+            .filter(Order.channel == state.channel, Order.customer_phone == state.external_id)
+            .order_by(Order.id.desc())
+            .first()
+        )
+    if not order:
+        return "I don't see any orders on your account yet -- reply with a category name to start one!"
+
+    items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+    item_lines = []
+    for it in items:
+        product = db.query(Product).filter(Product.id == it.product_id).first()
+        name = product.name if product else "item"
+        item_lines.append(f"{it.quantity} x {name}")
+
+    status_word = {
+        OrderStatusEnum.confirmed: "Confirmed",
+        OrderStatusEnum.flagged: "Being reviewed by our team",
+        OrderStatusEnum.failed: "Payment not completed",
+    }.get(order.status, "In progress")
+
+    return (
+        f"Order #{order.id}\n"
+        f"Items: {', '.join(item_lines) if item_lines else '—'}\n"
+        f"Total: Rs.{float(order.total_amount):.0f}\n"
+        f"Payment: {order.payment_status.value}\n"
+        f"Status: {status_word}"
+    )
+
+
 def handle_inbound_message(channel: str, external_id: str, sender_name: str | None, text: str) -> None:
     db = SessionLocal()
     try:
         state = _get_or_create_state(db, channel, external_id, sender_name)
-        parsed = parse_customer_message(_catalog_text(db), state.state.value, str(state.cart or {}), text or "")
+        parsed = parse_customer_message(
+            _categories_text(db), _catalog_text(db), state.state.value, str(state.cart or {}), text or "",
+        )
         intent = parsed.get("intent", "other")
 
         if state.state == ConvStateEnum.new or intent == "greeting":
             state.state = ConvStateEnum.browsing
             db.commit()
             send_text(channel, external_id, parsed["reply_text"])
-            _send_catalog(db, channel, external_id)
+            _send_categories(db, channel, external_id)
             return
 
-        if intent == "browse_catalog":
+        if intent == "browse_categories":
             send_text(channel, external_id, parsed["reply_text"])
-            _send_catalog(db, channel, external_id)
+            _send_categories(db, channel, external_id)
+            return
+
+        if intent == "select_category":
+            category = _find_category(db, parsed.get("category_name"))
+            if not category:
+                send_text(channel, external_id, "Sorry, I couldn't find that category -- here they are again:")
+                _send_categories(db, channel, external_id)
+                return
+            _send_category_page(db, state, category, offset=0)
+            db.commit()
+            return
+
+        if intent == "show_more":
+            ctx = state.context or {}
+            category = db.query(Category).filter(Category.id == ctx.get("category_id")).first()
+            if not category:
+                send_text(channel, external_id, "Not sure which category you meant -- here they are:")
+                _send_categories(db, channel, external_id)
+                return
+            next_offset = int(ctx.get("offset", 0)) + CATEGORY_PAGE_SIZE
+            _send_category_page(db, state, category, offset=next_offset)
+            db.commit()
             return
 
         if intent == "select_item":
             product = _find_product(db, parsed.get("product_name"))
             if not product:
-                send_text(channel, external_id, "Sorry, I couldn't find that item -- here's the catalog again:")
-                _send_catalog(db, channel, external_id)
+                send_text(channel, external_id, "Sorry, I couldn't find that item -- here are our categories again:")
+                _send_categories(db, channel, external_id)
                 return
             qty = max(1, int(parsed.get("quantity") or 1))
             if product.stock < qty:
-                send_text(channel, external_id, f"Sorry, only {product.stock} left of {product.name}. How many would you like?")
+                send_text(channel, external_id, f"Sorry, we don't have that many available. How many would you like instead?")
                 return
             state.cart = {"product_id": product.id, "name": product.name, "price": float(product.price), "quantity": qty}
             db.commit()
@@ -195,17 +318,29 @@ def handle_inbound_message(channel: str, external_id: str, sender_name: str | No
 
         if intent == "confirm_order":
             if not state.cart or not state.cart.get("product_id"):
-                send_text(channel, external_id, "You haven't picked an item yet -- here's the catalog:")
-                _send_catalog(db, channel, external_id)
+                send_text(channel, external_id, "You haven't picked an item yet -- here are our categories:")
+                _send_categories(db, channel, external_id)
                 return
             _create_order_and_payment_link(db, state)
+            return
+
+        if intent == "order_status":
+            send_text(channel, external_id, _describe_order(db, state))
+            return
+
+        if intent == "restricted_info":
+            send_text(
+                channel, external_id,
+                parsed.get("reply_text") or "Sorry, that's not something I'm able to share here. "
+                "Happy to help you browse or check an order instead!",
+            )
             return
 
         if intent == "cancel":
             state.cart = {}
             state.state = ConvStateEnum.browsing
             db.commit()
-            send_text(channel, external_id, "No problem, cancelled. Let me know if you'd like to see the catalog again.")
+            send_text(channel, external_id, "No problem, cancelled. Let me know if you'd like to see our categories again.")
             return
 
         send_text(channel, external_id, parsed.get("reply_text") or "Sorry, could you rephrase that?")
@@ -214,9 +349,12 @@ def handle_inbound_message(channel: str, external_id: str, sender_name: str | No
 
 
 def issue_refund_and_reassure(order_id: int) -> None:
-    """Called when an order's processing pipeline exhausts all retries and
-    lands in the DLQ. If payment was captured, refund it, and message the
-    customer a calm, reassuring note -- never leave them wondering."""
+    """Called when an order's processing pipeline exhausts all retries AFTER
+    payment already succeeded (e.g. an inventory-step failure) and lands in
+    the DLQ. Refunds the payment and sends a calm, honest, reassuring note.
+    NOT used for payments that never went through in the first place -- see
+    queue_worker.py's DLQ branch, which routes those to an honest "that
+    didn't go through" message instead (send_payment_failed_message below)."""
     db = SessionLocal()
     try:
         order = db.query(Order).filter(Order.id == order_id).first()
@@ -241,6 +379,27 @@ def issue_refund_and_reassure(order_id: int) -> None:
                 "We're sorry -- we ran into an issue processing your order. Your payment has "
                 "already gone through, so a full refund is on its way and you don't need to do "
                 "anything further. We'll follow up here shortly.",
+            )
+    finally:
+        db.close()
+
+
+def send_payment_failed_message(order_id: int) -> None:
+    """Honest counterpart to issue_refund_and_reassure(): used when a payment
+    genuinely never completed (no charge occurred), after backend auto-retry
+    confirmed it via Razorpay. Never claims money was taken."""
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            return
+        conv = db.query(ConversationState).filter(ConversationState.pending_order_id == order.id).first()
+        if conv:
+            channel_val = conv.channel.value if hasattr(conv.channel, "value") else conv.channel
+            send_text(
+                channel_val, conv.external_id,
+                "That payment didn't go through and no charge was made. Whenever you're ready, "
+                "just reply with the item name again and I'll send a fresh payment link.",
             )
     finally:
         db.close()
