@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     QUEUE_POLL_INTERVAL_SECONDS: int = 2
     MAX_RETRIES: int = 5
 
+    # Kept small by default since free-tier MySQL hosts (Aiven, PlanetScale, etc.)
+    # cap total concurrent connections low. Raise these only for load testing
+    # against a DB that can actually handle it (see locustfile.py).
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 5
+
     META_VERIFY_TOKEN: str = ""
     META_APP_SECRET: str = ""
 

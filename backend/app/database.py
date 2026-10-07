@@ -7,8 +7,8 @@ engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
     pool_recycle=280,
-    pool_size=80,       # matches raised anyio thread limiter (100) with headroom
-    max_overflow=60,    # total ceiling 100, comfortably under MySQL max_connections=151
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
     pool_timeout=30,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
